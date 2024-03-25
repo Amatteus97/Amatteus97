@@ -1,2 +1,2 @@
-Welcome to Matteo Bernardinetti's public repository! 
-Here I insert some codes that I have developed over the years and which represent the different programming languages ​​that I know.
+This branch contains the codes I wrote in Fortran during my master's degree in physics.
+I concentrated my studies in theoretical computational physics, so I have written several codes but here I will only report the main ones.
