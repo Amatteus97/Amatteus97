@@ -1,0 +1,601 @@
+module mcmod
+    implicit none
+    integer, public, parameter :: dp = selected_real_kind(8), di = selected_int_kind(16)
+    integer, public, parameter :: bi = selected_int_kind(33)
+    integer, public :: lx, ly, nsite, nbos, wdeg, ndis, pflux, qflux
+    real(dp), public :: Vpot, Upot, twopiq
+    complex(8), public, dimension(:), allocatable :: flux 
+    type jpp
+
+    integer :: jno
+    real(dp) :: jp 
+
+end type jpp
+contains
+
+subroutine init_random_seed()
+    use iso_fortran_env, only: int64
+    implicit none
+    integer, allocatable :: seed(:)
+    integer :: i, n, un, istat, dt(8), pid
+    integer(int64) :: t
+  
+    call random_seed(size = n)
+    allocate(seed(n))
+    ! First try if the OS provides a random number generator
+    open(newunit=un, file="/dev/urandom", access="stream", &
+         form="unformatted", action="read", status="old", iostat=istat)
+    if (istat == 0) then
+       read(un) seed
+       close(un)
+    else
+       ! Fallback to XOR:ing the current time and pid. The PID is
+       ! useful in case one launches multiple instances of the same
+       ! program in parallel.
+       call system_clock(t)
+       if (t == 0) then
+          call date_and_time(values=dt)
+          t = (dt(1) - 1970) * 365_int64 * 24 * 60 * 60 * 1000 &
+               + dt(2) * 31_int64 * 24 * 60 * 60 * 1000 &
+               + dt(3) * 24_int64 * 60 * 60 * 1000 &
+               + dt(5) * 60 * 60 * 1000 &
+               + dt(6) * 60 * 1000 + dt(7) * 1000 &
+               + dt(8)
+       end if
+       pid = getpid()
+       t = ieor(t, int(pid, kind(t)))
+       do i = 1, n
+          seed(i) = lcg(t)
+       end do
+    end if
+    call random_seed(put=seed)
+  contains
+    ! This simple PRNG might not be good enough for real work, but is
+    ! sufficient for seeding a better PRNG.
+    function lcg(s)
+      integer :: lcg
+      integer(int64) :: s
+      if (s == 0) then
+         s = 104729
+      else
+         s = mod(s, 4294967296_int64)
+      end if
+      s = mod(s * 279470273_int64, 4294967291_int64)
+      lcg = int(mod(s, int(huge(0), int64)), kind(0))
+    end function lcg
+  end subroutine init_random_seed
+
+subroutine init(iconf)
+    use iso_fortran_env, only: int64
+    implicit none
+    integer, dimension(nsite), intent(out) :: iconf
+    integer :: i, j,  n
+    real(dp) :: ir
+    integer(int64) :: s
+    integer, dimension(:) , allocatable:: seed
+    call random_seed( size = n)
+    allocate(seed(n))
+    do s = 1, n
+        seed(s) =  mod(s* 279470273_int64, 4294967296_int64)
+     end do
+    call random_seed(put=seed)
+    
+    do j = 1, nbos
+        call random_number(ir)
+        i = ceiling(ir*nsite)
+        iconf(i) = iconf(i) +1
+    end do
+
+end subroutine init
+
+subroutine mcloop(iconf, alfa, nnlist, tabpip, vjstrw)
+implicit none
+integer, dimension(nsite), intent(inout) :: iconf
+integer, dimension(nsite, 4), intent(inout) :: nnlist
+complex(8),dimension(nsite), intent(inout) :: alfa
+integer, dimension(2) :: pair
+real(dp) :: ir, ratio
+complex(8), dimension(nsite), intent(out) :: tabpip 
+real(dp), dimension(nsite,nsite), intent(inout) :: vjstrw
+
+call rndpair(nnlist, pair)
+
+call ratiovar(pair,  iconf, alfa, ratio, tabpip, vjstrw)
+
+call random_number(ir)
+
+
+if ( ir < ratio ) then
+    call update(iconf, tabpip, pair, vjstrw)
+end if
+
+
+end subroutine mcloop
+
+subroutine l_energy(nnlist, iconf, alfa, vjstrw, el, tabpip)
+implicit none
+real(dp), dimension(nsite +nsite,nsite), intent(in) :: vjstrw
+complex(8), dimension(nsite), intent(in) :: alfa
+integer, dimension(nsite), intent(in) :: iconf
+integer, dimension(nsite, 4), intent(in) :: nnlist
+complex(8) :: deltatab
+complex(8) :: ratio
+integer :: i, j, vici
+complex(8), intent(out) :: el
+complex(8), dimension(nsite), intent(in) :: tabpip
+
+el = (0.0_dp,0.0_dp)
+do i = 1, nsite 
+    do j = 1, 4
+        vici = nnlist(i, j)
+        ratio = alfa(vici)/alfa(i)
+        deltatab = tabpip(vici)-tabpip(i)
+        ratio = ratio * exp(deltatab)*exp(cmplx(-vjstrw(i, vici)+vjstrw(1, 1),&
+        &-vjstrw(i + nsite, vici) +vjstrw(1 +nsite, 1), 8))
+        if ( j < 3 ) el = el - flux(i)*cmplx(iconf(i), 0.0_dp, 8)*ratio
+        if ( j > 2 ) el = el - conjg(flux(i)*cmplx(iconf(i), 0.0_dp, 8))*ratio
+        el = el + cmplx(Vpot*iconf(i)*iconf(vici), 0.0_dp, 8)
+    end do
+    el = el + cmplx(0.5*Upot*iconf(i)*(iconf(i)-1), 0.0_dp, 8)
+
+end do
+end subroutine l_energy
+
+
+subroutine update(iconf, tabpip, pair, vjstrw)
+implicit none
+integer, dimension(nsite), intent(inout) :: iconf
+complex(8), dimension(2*nsite), intent(inout) :: tabpip
+integer, dimension(2), intent(in) :: pair
+integer :: i
+real(dp), dimension(2*nsite,nsite), intent(in) :: vjstrw
+
+    iconf(pair(1)) = iconf(pair(1)) -1
+    iconf(pair(2)) = iconf(pair(2)) +1
+
+    do i = 1, nsite
+        tabpip(i) = tabpip(i) + cmplx(vjstrw(i, pair(2)) - vjstrw(i, pair(1)), &
+        &vjstrw(i +nsite, pair(2)) - vjstrw(i +nsite, pair(1)), 8)
+    end do
+
+end subroutine update
+
+subroutine rndpair(nnlist, pair)
+implicit none
+integer, dimension(nsite, 4), intent(in) :: nnlist
+integer, dimension(2), intent(out) :: pair
+integer :: k, j
+real(dp) :: ir
+
+call random_number(ir)
+k = ceiling(ir*nsite)
+pair(1) = k
+call random_number(ir)
+j = ceiling(ir*4)
+pair(2) = nnlist(k, j)
+
+end subroutine rndpair
+
+subroutine ratiovar(pair,  iconf, alfa, ratio, tabpip, vjstrw)
+implicit none
+complex(8),dimension(nsite), intent(in) :: alfa
+integer,dimension(2), intent(in) :: pair
+integer,dimension(nsite), intent(inout) :: iconf
+real(dp),intent(out) ::  ratio
+complex(8), dimension(nsite), intent(in) :: tabpip 
+real(dp), dimension(nsite +nsite,nsite), intent(in) :: vjstrw
+complex(8) :: deltatab, ratio2
+
+    if ( iconf(pair(1)) == 0) then
+        ratio = 0.0_dp
+    else
+        if ( abs(alfa(pair(1))) == 0 ) then
+            ratio = 0.0_dp
+        else
+            ratio2 = real(conjg(alfa(pair(2)))*alfa(pair(2)),dp)/real(conjg(alfa(pair(1)))*alfa(pair(1)),dp)
+            ratio2 = ratio2 * real(iconf(pair(1)), dp)/ real(iconf(pair(2)) +1, dp)
+            deltatab = (tabpip(pair(2))-tabpip(pair(1)))
+            ratio2 = ratio2 * exp(deltatab)*exp(cmplx((-vjstrw(pair(1), pair(2))+vjstrw(1, 1)), &
+            &(-vjstrw(pair(1) + nsite, pair(2))+vjstrw(1 +nsite, 1)), 8))
+            ratio = real(conjg(ratio2)*ratio2, dp)
+        end if
+
+    end if
+
+end subroutine ratiovar
+
+subroutine tjpip(vjstrw, iconf, tabpip)
+implicit none
+real(dp), dimension(nsite +nsite,nsite), intent(in) :: vjstrw
+integer,dimension(nsite), intent(in) :: iconf
+complex(8), dimension(nsite), intent(out) :: tabpip 
+integer :: i, j
+
+do i = 1, nsite
+    do j = 1, nsite
+        tabpip(i) = tabpip(i) + cmplx(vjstrw(i, j),vjstrw(i +nsite, j), 8) *iconf(j)
+    end do
+end do
+
+end subroutine tjpip
+
+subroutine l_estim(vjstrw, teta, iconf)
+implicit none
+integer, dimension(nsite,nsite), intent(in) :: vjstrw
+integer, dimension(nsite), intent(in) :: iconf
+real(dp), dimension(0:ndis-1),intent(out) ::  teta
+integer :: i, j, r
+
+teta = 0
+
+do i = 1, nsite
+    do j = 1, nsite
+        do r = 0, ndis-1
+            if ( vjstrw(i,j) == r ) then
+                teta(r) = teta(r) + 0.5*iconf(i)*iconf(j)
+            end if
+        end do
+    end do
+end do
+
+
+end subroutine l_estim
+
+
+subroutine ottimo(deri, vjstrw, delta, nump)
+implicit none
+
+integer, intent(in) :: nump
+real(dp), dimension(0:2*ndis-1), intent(in) :: deri
+type(jpp), dimension(2*nsite, nsite), intent(out) :: vjstrw
+real(dp), intent(in) :: delta
+integer :: i, j, k
+
+do i = 1, nump
+    do j = 1, nsite
+        do k = 1, nsite
+            if ( vjstrw(j,k)%jno == i-1) then
+                vjstrw(j,k)%jp = vjstrw(j,k)%jp - deri(i-1)*delta
+                vjstrw(j +nsite,k)%jp = vjstrw(j + nsite,k)%jp - deri(i-1 + ndis)*delta
+            end if
+        end do
+        
+    end do
+
+end do
+
+end subroutine ottimo
+
+subroutine stc_mtx(t_m1, t_m2, s, nott)
+implicit none
+real(dp), dimension(0:2*ndis-1, 0:2*ndis-1),intent(in) :: t_m1
+real(dp), dimension(0:2*ndis-1),intent(in) :: t_m2
+integer, intent(in) :: nott
+real(dp), dimension(2*nott, 2*nott), intent(inout) :: s
+real(dp), dimension(2*nott) :: eigen
+real(dp) :: check, eps
+integer :: i, j
+
+do i = 1, nott
+    do j = 1, nott
+        s(i,j) = 2*(t_m1(i-1, j-1) - (t_m2(i-1)*t_m2(j-1)))
+        s(i+nott, j +nott) = 2*(t_m1(i-1, j-1) - (t_m2(i-1)*t_m2(j-1)))
+    end do
+end do
+
+call eigenvalue(eigen, s, 2*nott)
+
+check = 0.0_dp
+eps = 0.0_dp
+do i = 1, 2*nott
+    if ( eigen(i) <= 0.0_dp ) then
+        write(6, *) "warning : s not positive"
+        if ( eigen(i) < check ) check = eigen(i)
+        write(6,*) eigen
+    end if
+end do
+if ( check < 0.0_dp ) eps = abs(check) + 0.00001
+
+s = s + eps
+
+end subroutine stc_mtx
+
+    
+subroutine eigenvalue(alfa, H, n)
+    implicit none
+          INTEGER, intent(in) :: n
+          real(dp), dimension(n, n), intent(in) :: H
+          real(dp), dimension(n), intent(out):: alfa
+          INTEGER ::  INFO, lwork
+          real(dp), dimension(:), allocatable:: WORK 
+          real(dp), dimension(n, n) :: a
+          lwork = 3*n
+          a = H
+          Allocate (work(lwork))
+          call dsyev('n', 'u', n, a, n, alfa, WORK, lwork, INFO)
+          if ( INFO .ne. 0 ) then
+            print *, "non va bene"
+            print *, "info", info
+          end if
+    deallocate(work)
+        
+end subroutine eigenvalue
+
+subroutine inverse_s(a, deri, nott, stc_deri)
+implicit none
+
+integer, intent(in) :: nott
+real(dp), dimension(2*nott, 2*nott), intent(inout) :: a 
+real(dp), dimension(0:2*ndis-1), intent(in) :: deri
+real(dp), dimension(0:2*ndis-1), intent(out) :: stc_deri
+integer, dimension(2*nott) :: ipvt
+integer :: info, lwork, i, j
+real(dp), dimension(:), allocatable :: work
+
+lwork = 2*nott +1
+
+allocate(work(lwork))
+
+CALL DGETRF( 2*nott , 2*nott , a,  2*nott , IPVT, INFO )
+
+CALL DGETRI( 2*nott , a , 2*nott , IPVT , WORK ,  lwork  , INFO )
+
+deallocate(work)
+
+stc_deri = 0
+
+do i = 1, 2*nott
+    do j = 1, 2*nott
+        stc_deri(i-1) = stc_deri(i-1) + a(i,j) * deri(j-1)
+    end do
+end do
+
+end subroutine inverse_s
+
+end module mcmod
+
+program Monty
+    use mcmod
+    implicit none
+
+    integer, dimension(:), allocatable :: iconf
+    complex(8), dimension(:,:), allocatable :: wa
+    integer :: fu, rc, i, j, k, nmcstep, nump, l, nest, ntbpp, npar, b, nott
+    type(jpp), dimension(:,:), allocatable :: vjstrw
+    real(dp), dimension(:), allocatable :: gam, teta, media3, deri, stc_deri
+    integer, dimension(:,:), allocatable :: nnlist
+    complex(8), dimension(:), allocatable :: alfa, media1, media2, tabpip, vcx, media5
+    complex(8) :: el, v_d
+    real(dp) :: delta
+    real(dp), dimension(:,:), allocatable :: s, media4
+
+        ! Namelist definition.
+    namelist /latticeparameter/ lx, ly, nsite, wdeg, ndis
+    namelist /hamiltonian/ pflux, qflux, nbos, Vpot, Upot
+    NAMELIST /num/ nmcstep, nest, ntbpp, npar, nott, delta
+
+    lx=0
+    ly=0
+    nsite=0
+    nbos=0
+    wdeg=0
+    pflux=0
+    Vpot=0
+    Upot=0
+    nmcstep = 0
+    nest = 0 
+    ntbpp = 0
+    npar = 0
+    nott = 0
+    delta = 0
+    
+
+
+    open(unit = 80, file = 'local_energy.txt')
+    open(unit = 81, file = 'local_num.txt')
+    ! Check whether file exists.
+    inquire (file='latticeparameter.nml', iostat=rc)
+
+    if (rc /= 0) then
+        write (6, '(3a)') 'Error: input file "', trim('latticeparameter.nml'), '" does not exist.'
+    end if
+
+    ! Open and read Namelist file.
+    open (action='read', file='latticeparameter.nml', iostat=rc, newunit=fu)
+    read (nml=latticeparameter, iostat=rc, unit=fu)
+
+    if (rc /= 0) then
+        write (6, '(a)') 'Error: invalid Namelist format.'
+    end if
+
+    close (fu)
+
+        ! Check whether file exists.
+    inquire (file='hamiltonian.nml', iostat=rc)
+
+    if (rc /= 0) then
+        write (6, '(3a)') 'Error: input file "', trim('hamiltonian.nml'), '" does not exist.'
+    end if
+
+    ! Open and read Namelist file.
+    open (action='read', file='hamiltonian.nml', iostat=rc, newunit=fu)
+    read (nml=hamiltonian, iostat=rc, unit=fu)
+
+    if (rc /= 0) then
+        write (6, '(a)') 'Error: invalid Namelist format.'
+    end if
+
+    close (fu)
+
+            ! Check whether file exists.
+    inquire (file='num.nml', iostat=rc)
+
+    if (rc /= 0) then
+        write (6, '(3a)') 'Error: input file "', trim('num.nml'), '" does not exist.'
+    end if
+
+    ! Open and read Namelist file.
+    open (action='read', file='num.nml', iostat=rc, newunit=fu)
+    read (nml=num, iostat=rc, unit=fu)
+
+    if (rc /= 0) then
+        write (6, '(a)') 'Error: invalid Namelist format.'
+    end if
+
+    close (fu)
+
+
+    allocate(iconf(nsite),wa(nsite, wdeg), vjstrw(nsite +nsite, nsite), gam(wdeg), nnlist(nsite,4), stc_deri(0:ndis-1))
+    allocate(alfa(nsite), tabpip(nsite), flux(nsite), teta(0:ndis-1), deri(0:2*ndis-1), s(2*nott, 2*nott), media5(0: ndis-1))
+    allocate(media1(0:ndis-1), media2(0:ndis-1), media3(0:2*ndis-1), vcx(0:ndis), media4(0:2*ndis-1, 0:2*ndis-1))
+
+    alfa = 0
+
+
+    open(13, file = "eigenvector.txt")
+
+    do j = 1, nsite
+        do i = 1, wdeg
+            read(13, *) wa(j, i)
+        end do
+        
+    end do
+
+    close(13)
+
+    open(unit = 99, file = 'nnlist.txt')
+    do i = 1, nsite
+        do k = 1, 4
+            read(99, *) nnlist(i,k)
+        end do
+    end do
+    close(99)
+
+    open(13, file = "jastrow.txt")
+
+    do j = 1, nsite
+        do i = 1, nsite
+
+            read(13, *) vjstrw(i, j)%jno, v_d
+
+            vjstrw(i, j)%jp = real(v_d, dp)
+            vjstrw(i +nsite, j)%jp = real(aimag(v_d), dp)
+
+        end do
+        
+    end do
+
+    close(13)
+
+
+    open(13, file = "gamma.txt")
+
+    do j = 1, wdeg
+
+        read(13, *) gam(j)
+
+    end do
+
+    close(13)
+
+    twopiq = 4*acos(0.0_dp)/qflux
+
+    do i = 1, nsite
+
+        flux(i) = exp(cmplx(0.0_dp, -twopiq*pflux*i, 8))
+    end do
+
+    do i = 1, nsite
+        do j = 1, wdeg
+              alfa(i) = alfa(i) + wa(i, j)*gam(j)
+        end do
+    end do
+
+    iconf = 0
+
+    call init(iconf)
+    iconf = 1
+    
+    iconf(2) = 2
+    iconf(3) = 3
+    iconf(5) = 0
+    iconf(9) = 0
+    iconf(12) = 0
+    iconf(14) = 2
+    iconf(16) = 0
+
+
+    do k = 1, npar
+        j=0
+        media1 = 0
+        media2 = 0
+        media3 = 0
+        media4 = 0
+        media5 = 0
+        tabpip = 0
+        call tjpip(vjstrw%jp, iconf, tabpip)
+        do i = 1, nmcstep
+    
+            if (mod(i, nest) == 0) then
+    
+                j = j+1
+                call l_energy(nnlist, iconf, alfa, vjstrw%jp, el, tabpip)
+                write(80,*)  el/nsite
+                call l_estim(vjstrw%jno, teta, iconf)
+                do l = 0, ndis-1
+                    media1(l) = teta(l)*el + media1(l)
+                    media2(l) = el + media2(l)
+                    media5(l) = conjg(el)*teta(l) + media5(l)
+                    media3(l +ndis) = teta(l) + media3(l)
+                    do b = 0, ndis -1
+                        media4(l, b) = media4(l, b) + teta(l)*teta(b)
+                        media4(l+ ndis, b +ndis) = media4(l +ndis, b +ndis) + teta(l)*teta(b)
+                    end do
+                end do
+    
+            end if
+
+
+            call mcloop(iconf, alfa, nnlist, tabpip, vjstrw%jp)
+    
+            if ( mod(i, ntbpp) == 0 ) then
+                tabpip = 0
+                call tjpip(vjstrw%jp, iconf, tabpip)
+            end if
+
+
+        end do
+        nump = nott
+
+        write(81,*) j
+
+        do l = 0, ndis-1
+            deri(l) = real((media1(l)/j) + (conjg(media1(l))/j), dp) - 2*real((media2(l)/j), dp)*(media3(l)/j)
+            deri(l +ndis) = -2*real(aimag((media5(l)/j) - (media1(l)/j)), dp)
+        end do
+        media3 = media3/j
+        media4 = media4/j
+        s=0
+        call stc_mtx(media4, media3, s, nott)
+
+        call inverse_s(s, deri, nott, stc_deri)
+
+        call ottimo(stc_deri, vjstrw, delta, nump)
+
+        do b = 1, nsite
+            do l = 0, ndis-1
+                if ( vjstrw(1,b)%jno == l ) then
+                    vcx(l) = cmplx(vjstrw(1,b)%jp, vjstrw(1 + nsite,b)%jp, 8)
+                end if
+            end do
+        end do
+    end do
+
+    close(80)
+    close(81)
+
+    deallocate(iconf, wa, vjstrw, gam, nnlist, alfa, tabpip, s, stc_deri)
+    deallocate(teta, media1, media2, deri, vcx, media3, media4)
+
+    
+end program Monty
